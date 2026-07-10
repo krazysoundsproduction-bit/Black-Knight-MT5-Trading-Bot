@@ -4,7 +4,7 @@
 //|   Architecture-first implementation aligned to user specification |
 //+------------------------------------------------------------------+
 #property copyright "krazysoundsproduction-bit"
-#property version   "3.10"
+#property version   "3.20"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -29,6 +29,15 @@ enum eObservationState {
    OBS_AtResistance,
    OBS_WaitBreakRetestSupport,
    OBS_WaitBreakRetestResistance
+};
+enum eStructureDirection { SD_Neutral = 0, SD_Bullish = 1, SD_Bearish = -1 };
+enum eSetupCategory {
+   SETUP_None = 0,
+   SETUP_SupportBounce = 1,
+   SETUP_ResistanceRejection = 2,
+   SETUP_BullBreakoutRetest = 3,
+   SETUP_BearBreakoutRetest = 4,
+   SETUP_FalseBreakReversal = 5
 };
 
 //=================== INPUTS ===================
@@ -57,11 +66,14 @@ input group "=== Observation Mode ==="
 input int             ObservationBarsMin          = 2;
 input int             ObservationBarsMax          = 10;
 input bool            RequireRetestAfterBreak     = true;
+input int             RetestMaxBars               = 6;
+input int             RetestTouchTolerancePts     = 10;
 
 input group "=== Price Action ==="
 input bool            EnableEngulfing             = true;
 input bool            EnablePinBars               = true;
 input bool            EnableInsideOutside         = true;
+input int             PriceActionScoreThreshold   = 25;
 
 input group "=== Probability Engine ==="
 input int             WeightStructure             = 15;
@@ -86,6 +98,9 @@ input double          MaxDrawdownPercent          = 12.0;
 input int             MaxConsecutiveLosses        = 3;
 input bool            EmergencyShutdownEnabled    = true;
 input double          EmergencyMinMarginLevel     = 120.0;
+input double          BreakEvenActivationR        = 1.0;
+input double          ATRTrailMultiplier          = 1.0;
+input bool            ExitOnSetupInvalidation     = true;
 
 input group "=== Execution Filters ==="
 input bool            EnableSpreadProtection      = true;
@@ -113,6 +128,10 @@ input string          ThursdaySessionEnd          = "20:00";
 input bool            FridayTrading               = true;
 input string          FridaySessionStart          = "08:00";
 input string          FridaySessionEnd            = "18:00";
+
+input group "=== Setup Statistics ==="
+input bool            EnableSetupStatsLogging     = true;
+input int             SetupStatsLogEveryBars      = 30;
 
 //=================== DATA STRUCTURES ===================
 struct SwingPoint
@@ -152,6 +171,16 @@ struct MarketState
    double        volatilityScore; // 0..100
    int           contextScore;    // 0..10
    int           liquidityScore;  // 0..10
+   bool          bosBullExternal;
+   bool          bosBearExternal;
+   bool          bosBullInternal;
+   bool          bosBearInternal;
+   eStructureDirection structureDirection;
+   datetime      lastBosBullTime;
+   datetime      lastBosBearTime;
+   datetime      lastChochBullTime;
+   datetime      lastChochBearTime;
+   datetime      lastStructureBreakTime;
 };
 
 struct SignalState
@@ -164,6 +193,18 @@ struct SignalState
    bool resistanceHolding;
    bool breakoutRetestBull;
    bool breakoutRetestBear;
+   int  bullishScore;
+   int  bearishScore;
+};
+
+struct SetupStats
+{
+   int attempts;
+   int wins;
+   int losses;
+   double netProfit;
+   double totalR;
+   int closedTrades;
 };
 
 struct ProbabilityBreakdown
@@ -192,6 +233,14 @@ eObservationState observationState = OBS_None;
 int observationBars = 0;
 datetime observationStart = 0;
 datetime lastProcessedBar = 0;
+double brokenSupportLevel = 0.0;
+double brokenResistanceLevel = 0.0;
+datetime brokenSupportTime = 0;
+datetime brokenResistanceTime = 0;
+datetime lastBreakSupportEvent = 0;
+datetime lastBreakResistanceEvent = 0;
+double lastBreakSupportLevel = 0.0;
+double lastBreakResistanceLevel = 0.0;
 
 double dayStartEquity = 0.0;
 double peakEquity = 0.0;
@@ -201,6 +250,12 @@ bool dailyLock = false;
 int atrHandle = INVALID_HANDLE;
 int rsiHandle = INVALID_HANDLE;
 int volHandle = INVALID_HANDLE;
+
+SetupStats setupStats[6];
+ulong trackedPositionIds[];
+int trackedPositionCategory[];
+double trackedPositionRiskMoney[];
+int barsSinceStatsLog = 0;
 
 //=================== HELPERS ===================
 int TimeStrToMinutes(string hhmm)
@@ -285,6 +340,115 @@ double GetATR()
    return a[0];
 }
 
+double NormalizeVolumeToSymbol(double volume)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+
+   double v = MathMax(minLot, MathMin(maxLot, volume));
+   v = MathFloor((v + 1e-9) / step) * step;
+   v = NormalizeDouble(v, 2);
+   if(v < minLot) v = minLot;
+   return v;
+}
+
+void ValidateStopsBySymbolRules(ENUM_ORDER_TYPE type, double entry, double &sl, double &tp)
+{
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   int freezeLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   int minPts = (int)MathMax(stopsLevel, freezeLevel);
+   if(minPts < 0) minPts = 0;
+   double minDist = (minPts + 2) * _Point;
+
+   if(type == ORDER_TYPE_BUY)
+   {
+      if(sl >= entry || sl <= 0) sl = entry - minDist;
+      if(entry - sl < minDist) sl = entry - minDist;
+
+      if(tp <= entry || tp <= 0) tp = entry + minDist * 2.0;
+      if(tp - entry < minDist) tp = entry + minDist;
+   }
+   else
+   {
+      if(sl <= entry || sl <= 0) sl = entry + minDist;
+      if(sl - entry < minDist) sl = entry + minDist;
+
+      if(tp >= entry || tp <= 0) tp = entry - minDist * 2.0;
+      if(entry - tp < minDist) tp = entry - minDist;
+   }
+
+   sl = NormalizeDouble(sl, _Digits);
+   tp = NormalizeDouble(tp, _Digits);
+}
+
+int BarsSince(datetime t)
+{
+   if(t <= 0) return 99999;
+   int shift = iBarShift(_Symbol, ExecutionTF, t, false);
+   if(shift < 0) return 99999;
+   return shift;
+}
+
+double EstimateRiskMoney(double riskPoints, double volume)
+{
+   if(riskPoints <= 0 || volume <= 0) return 0.0;
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickValue <= 0 || tickSize <= 0) return 0.0;
+   double pointValuePerLot = tickValue * (_Point / tickSize);
+   return riskPoints * pointValuePerLot * volume;
+}
+
+void RegisterTrackedPosition(ulong positionId, int setupCategory, double riskMoney)
+{
+   if(positionId == 0 || setupCategory <= SETUP_None || setupCategory > SETUP_FalseBreakReversal) return;
+
+   for(int i = 0; i < ArraySize(trackedPositionIds); i++)
+   {
+      if(trackedPositionIds[i] == positionId)
+      {
+         trackedPositionCategory[i] = setupCategory;
+         trackedPositionRiskMoney[i] = riskMoney;
+         return;
+      }
+   }
+
+   int sz = ArraySize(trackedPositionIds);
+   ArrayResize(trackedPositionIds, sz + 1);
+   ArrayResize(trackedPositionCategory, sz + 1);
+   ArrayResize(trackedPositionRiskMoney, sz + 1);
+   trackedPositionIds[sz] = positionId;
+   trackedPositionCategory[sz] = setupCategory;
+   trackedPositionRiskMoney[sz] = riskMoney;
+}
+
+bool PopTrackedPosition(ulong positionId, int &setupCategory, double &riskMoney)
+{
+   setupCategory = SETUP_None;
+   riskMoney = 0.0;
+   int sz = ArraySize(trackedPositionIds);
+   for(int i = 0; i < sz; i++)
+   {
+      if(trackedPositionIds[i] != positionId) continue;
+      setupCategory = trackedPositionCategory[i];
+      riskMoney = trackedPositionRiskMoney[i];
+
+      for(int j = i + 1; j < sz; j++)
+      {
+         trackedPositionIds[j-1] = trackedPositionIds[j];
+         trackedPositionCategory[j-1] = trackedPositionCategory[j];
+         trackedPositionRiskMoney[j-1] = trackedPositionRiskMoney[j];
+      }
+      ArrayResize(trackedPositionIds, sz - 1);
+      ArrayResize(trackedPositionCategory, sz - 1);
+      ArrayResize(trackedPositionRiskMoney, sz - 1);
+      return true;
+   }
+   return false;
+}
+
 //=================== ENGINE: SWING DETECTION ===================
 void UpdateSwings()
 {
@@ -345,7 +509,7 @@ void UpdateSwings()
 //=================== ENGINE: MARKET STRUCTURE ===================
 void UpdateMarketStructure()
 {
-   // derive HH/HL/LH/LL proxy from last 4 relevant swings
+   // external structure from confirmed swings on StructureTF
    double lastHigh = 0, prevHigh = 0, lastLow = 0, prevLow = 0;
    int hcount = 0, lcount = 0;
 
@@ -371,14 +535,76 @@ void UpdateMarketStructure()
    bool lh = (hcount >= 2 && lastHigh < prevHigh);
    bool ll = (lcount >= 2 && lastLow < prevLow);
 
-   // BOS/CHOCH proxy with closes relative to previous swings
-   double close0 = iClose(_Symbol, StructureTF, 1);
-   market.bosBull = (hcount >= 2 && close0 > prevHigh);
-   market.bosBear = (lcount >= 2 && close0 < prevLow);
+   double close1 = iClose(_Symbol, StructureTF, 1);
+   double close2 = iClose(_Symbol, StructureTF, 2);
+   datetime structureBarTime = iTime(_Symbol, StructureTF, 1);
 
-   // CHOCH simplistic phase-1 approximation
-   market.chochBull = (lh && market.bosBull);
-   market.chochBear = (hl && market.bosBear);
+   // close-confirmed BOS and de-duplicated by level crossing
+   bool bosBullExternal = (hcount >= 2 && close2 <= prevHigh && close1 > prevHigh);
+   bool bosBearExternal = (lcount >= 2 && close2 >= prevLow && close1 < prevLow);
+
+   if(bosBullExternal)
+   {
+      if(structureBarTime != lastBreakResistanceEvent || MathAbs(prevHigh - lastBreakResistanceLevel) > _Point)
+      {
+         market.lastBosBullTime = structureBarTime;
+         market.lastStructureBreakTime = structureBarTime;
+         lastBreakResistanceEvent = structureBarTime;
+         lastBreakResistanceLevel = prevHigh;
+      }
+      else bosBullExternal = false;
+   }
+   if(bosBearExternal)
+   {
+      if(structureBarTime != lastBreakSupportEvent || MathAbs(prevLow - lastBreakSupportLevel) > _Point)
+      {
+         market.lastBosBearTime = structureBarTime;
+         market.lastStructureBreakTime = structureBarTime;
+         lastBreakSupportEvent = structureBarTime;
+         lastBreakSupportLevel = prevLow;
+      }
+      else bosBearExternal = false;
+   }
+
+   // internal structure proxy from execution timeframe closes against recent internal range
+   double internalHi = -DBL_MAX;
+   double internalLo = DBL_MAX;
+   for(int i = 2; i <= 8; i++)
+   {
+      internalHi = MathMax(internalHi, iHigh(_Symbol, ExecutionTF, i));
+      internalLo = MathMin(internalLo, iLow(_Symbol, ExecutionTF, i));
+   }
+   double ec1 = iClose(_Symbol, ExecutionTF, 1);
+   double ec2 = iClose(_Symbol, ExecutionTF, 2);
+   market.bosBullInternal = (internalHi > -DBL_MAX && ec2 <= internalHi && ec1 > internalHi);
+   market.bosBearInternal = (internalLo < DBL_MAX && ec2 >= internalLo && ec1 < internalLo);
+
+   market.bosBullExternal = bosBullExternal;
+   market.bosBearExternal = bosBearExternal;
+   market.bosBull = (market.bosBullExternal || market.bosBullInternal);
+   market.bosBear = (market.bosBearExternal || market.bosBearInternal);
+
+   // CHOCH as first opposite-side break versus prior structure direction
+   market.chochBull = false;
+   market.chochBear = false;
+   if(market.bosBull && market.structureDirection != SD_Bullish)
+   {
+      market.chochBull = true;
+      market.lastChochBullTime = structureBarTime;
+      market.structureDirection = SD_Bullish;
+   }
+   else if(market.bosBear && market.structureDirection != SD_Bearish)
+   {
+      market.chochBear = true;
+      market.lastChochBearTime = structureBarTime;
+      market.structureDirection = SD_Bearish;
+   }
+   else
+   {
+      if(hh && hl) market.structureDirection = SD_Bullish;
+      else if(lh && ll) market.structureDirection = SD_Bearish;
+      else if(!(hh || hl || lh || ll)) market.structureDirection = SD_Neutral;
+   }
 
    // Regime classification
    if(hh && hl)
@@ -466,8 +692,8 @@ void RebuildZonesFromSwings()
 //=================== ENGINE: PRICE ACTION ===================
 void UpdatePriceActionSignals()
 {
-   signal.bullishPA = false;
-   signal.bearishPA = false;
+   signal.bullishScore = 0;
+   signal.bearishScore = 0;
    signal.falseBreakout = false;
    signal.falseBreakdown = false;
 
@@ -480,48 +706,118 @@ void UpdatePriceActionSignals()
    double c2 = iClose(_Symbol, ExecutionTF, 2);
    double h2 = iHigh(_Symbol, ExecutionTF, 2);
    double l2 = iLow(_Symbol, ExecutionTF, 2);
+   double o3 = iOpen(_Symbol, ExecutionTF, 3);
+   double c3 = iClose(_Symbol, ExecutionTF, 3);
+   double h3 = iHigh(_Symbol, ExecutionTF, 3);
+   double l3 = iLow(_Symbol, ExecutionTF, 3);
+
+   double range1 = h1 - l1;
+   double range2 = h2 - l2;
+   double body1 = MathAbs(c1 - o1);
+   double body2 = MathAbs(c2 - o2);
+   double body3 = MathAbs(c3 - o3);
+   double upperW1 = h1 - MathMax(c1, o1);
+   double lowerW1 = MathMin(c1, o1) - l1;
+   double upperW2 = h2 - MathMax(c2, o2);
+   double lowerW2 = MathMin(c2, o2) - l2;
+
+   if(range1 <= 0) range1 = _Point;
+   if(range2 <= 0) range2 = _Point;
 
    // engulfing
    if(EnableEngulfing)
    {
       bool bullEng = (c2 < o2 && c1 > o1 && c1 >= o2 && o1 <= c2);
       bool bearEng = (c2 > o2 && c1 < o1 && c1 <= o2 && o1 >= c2);
-      if(bullEng) signal.bullishPA = true;
-      if(bearEng) signal.bearishPA = true;
+      if(bullEng) signal.bullishScore += 22;
+      if(bearEng) signal.bearishScore += 22;
    }
 
-   // pin bar proxy
+   // hammer / shooting star / pin-bars
    if(EnablePinBars)
    {
-      double range1 = h1 - l1;
-      if(range1 > 0)
-      {
-         double body1 = MathAbs(c1 - o1);
-         double upperW = h1 - MathMax(c1, o1);
-         double lowerW = MathMin(c1, o1) - l1;
-
-         bool bullPin = (lowerW > body1 * 1.8 && upperW < body1);
-         bool bearPin = (upperW > body1 * 1.8 && lowerW < body1);
-         if(bullPin) signal.bullishPA = true;
-         if(bearPin) signal.bearishPA = true;
-      }
+      bool bullPin = (lowerW1 > body1 * 1.8 && upperW1 < body1 * 0.9);
+      bool bearPin = (upperW1 > body1 * 1.8 && lowerW1 < body1 * 0.9);
+      bool hammer = (lowerW1 > range1 * 0.45 && body1 / range1 < 0.35 && c1 >= o1);
+      bool shootingStar = (upperW1 > range1 * 0.45 && body1 / range1 < 0.35 && c1 <= o1);
+      if(bullPin || hammer) signal.bullishScore += 18;
+      if(bearPin || shootingStar) signal.bearishScore += 18;
    }
 
-   // inside / outside bars (contribute lightly)
+   // doji / marubozu / close location psychology
+   bool doji = (body1 / range1 <= 0.12);
+   bool bullMarubozu = (body1 / range1 >= 0.82 && c1 > o1 && upperW1 <= range1*0.08 && lowerW1 <= range1*0.08);
+   bool bearMarubozu = (body1 / range1 >= 0.82 && c1 < o1 && upperW1 <= range1*0.08 && lowerW1 <= range1*0.08);
+   if(doji)
+   {
+      if(lowerW1 > upperW1 * 1.2) signal.bullishScore += 6;
+      else if(upperW1 > lowerW1 * 1.2) signal.bearishScore += 6;
+   }
+   if(bullMarubozu) signal.bullishScore += 14;
+   if(bearMarubozu) signal.bearishScore += 14;
+
+   // inside / outside bars
    if(EnableInsideOutside)
    {
       bool inside = (h1 < h2 && l1 > l2);
       bool outside = (h1 > h2 && l1 < l2);
-      if(inside)
-      {
-         // neutral compression -> no direct side signal
-      }
+      if(inside) { signal.bullishScore += 3; signal.bearishScore += 3; }
       if(outside)
       {
-         if(c1 > o1) signal.bullishPA = true;
-         if(c1 < o1) signal.bearishPA = true;
+         if(c1 > o1) signal.bullishScore += 10;
+         if(c1 < o1) signal.bearishScore += 10;
       }
    }
+
+   // morning/evening star proxies (3-candle)
+   bool morningStar = (c3 < o3 && body3 / (h3-l3+_Point) > 0.45 &&
+                       body2 / range2 < 0.35 &&
+                       c1 > o1 && c1 >= (o3 + c3) * 0.5);
+   bool eveningStar = (c3 > o3 && body3 / (h3-l3+_Point) > 0.45 &&
+                       body2 / range2 < 0.35 &&
+                       c1 < o1 && c1 <= (o3 + c3) * 0.5);
+   if(morningStar) signal.bullishScore += 16;
+   if(eveningStar) signal.bearishScore += 16;
+
+   // three white soldiers / three black crows proxies
+   bool threeSoldiers = (c1 > o1 && c2 > o2 && c3 > o3 && c1 > c2 && c2 > c3 && body1 > range1*0.45 && body2 > range2*0.45);
+   bool threeCrows = (c1 < o1 && c2 < o2 && c3 < o3 && c1 < c2 && c2 < c3 && body1 > range1*0.45 && body2 > range2*0.45);
+   if(threeSoldiers) signal.bullishScore += 15;
+   if(threeCrows) signal.bearishScore += 15;
+
+   // long-wick rejection
+   if(lowerW1 > body1 * 2.2 && c1 > (l1 + range1 * 0.55)) signal.bullishScore += 11;
+   if(upperW1 > body1 * 2.2 && c1 < (h1 - range1 * 0.55)) signal.bearishScore += 11;
+
+   // expansion / contraction psychology
+   double avgRange = 0.0;
+   for(int i = 2; i <= 8; i++) avgRange += (iHigh(_Symbol, ExecutionTF, i) - iLow(_Symbol, ExecutionTF, i));
+   avgRange /= 7.0;
+   if(avgRange > 0)
+   {
+      if(range1 > avgRange * 1.35)
+      {
+         if(c1 > o1) signal.bullishScore += 8;
+         if(c1 < o1) signal.bearishScore += 8;
+      }
+      if(range1 < avgRange * 0.7)
+      {
+         signal.bullishScore += 2;
+         signal.bearishScore += 2;
+      }
+   }
+
+   // candle-pressure psychology from close location
+   double closePos = (c1 - l1) / range1; // 0..1
+   if(closePos >= 0.72) signal.bullishScore += 8;
+   if(closePos <= 0.28) signal.bearishScore += 8;
+   if(lowerW1 > upperW1 * 1.4) signal.bullishScore += 5;
+   if(upperW1 > lowerW1 * 1.4) signal.bearishScore += 5;
+
+   signal.bullishScore = (int)MathMax(0, MathMin(100, signal.bullishScore));
+   signal.bearishScore = (int)MathMax(0, MathMin(100, signal.bearishScore));
+   signal.bullishPA = (signal.bullishScore >= PriceActionScoreThreshold && signal.bullishScore > signal.bearishScore);
+   signal.bearishPA = (signal.bearishScore >= PriceActionScoreThreshold && signal.bearishScore > signal.bullishScore);
 }
 
 //=================== ENGINE: LIQUIDITY & FALSE BREAK ===================
@@ -630,20 +926,25 @@ bool PriceInZone(int &zoneIndex)
 
 void UpdateObservationMode()
 {
+   signal.supportHolding = false;
+   signal.resistanceHolding = false;
+   signal.breakoutRetestBull = false;
+   signal.breakoutRetestBear = false;
+
+   double c1 = iClose(_Symbol, ExecutionTF, 1);
+   double c2 = iClose(_Symbol, ExecutionTF, 2);
+   double h1 = iHigh(_Symbol, ExecutionTF, 1);
+   double l1 = iLow(_Symbol, ExecutionTF, 1);
+   double o1 = iOpen(_Symbol, ExecutionTF, 1);
+   double body1 = MathAbs(c1 - o1);
+   double upperW1 = h1 - MathMax(c1, o1);
+   double lowerW1 = MathMin(c1, o1) - l1;
+   datetime bar1Time = iTime(_Symbol, ExecutionTF, 1);
+
    int zi = -1;
    bool inZone = PriceInZone(zi);
 
-   if(!inZone)
-   {
-      if(observationState != OBS_None)
-      {
-         if(observationBars > ObservationBarsMax)
-            observationState = OBS_None;
-      }
-      return;
-   }
-
-   if(observationState == OBS_None)
+   if(inZone && observationState == OBS_None)
    {
       observationStart = TimeCurrent();
       observationBars = 0;
@@ -651,49 +952,86 @@ void UpdateObservationMode()
       else observationState = OBS_AtResistance;
    }
 
-   observationBars++;
-
-   // support/resistance hold logic (phase 1 proxy)
-   double c1 = iClose(_Symbol, ExecutionTF, 1);
-   signal.supportHolding = false;
-   signal.resistanceHolding = false;
-   signal.breakoutRetestBull = false;
-   signal.breakoutRetestBear = false;
-
-   if(zones[zi].type == ZT_Support)
+   if(inZone && zi >= 0)
    {
-      if(c1 >= zones[zi].low) signal.supportHolding = true;
-      // support break
-      if(c1 < zones[zi].low - ZoneInvalidationBufferPts * _Point)
-         observationState = OBS_WaitBreakRetestSupport;
-   }
-   else
-   {
-      if(c1 <= zones[zi].high) signal.resistanceHolding = true;
-      // resistance break
-      if(c1 > zones[zi].high + ZoneInvalidationBufferPts * _Point)
-         observationState = OBS_WaitBreakRetestResistance;
+      observationBars++;
+      if(zones[zi].type == ZT_Support && c1 >= zones[zi].low) signal.supportHolding = true;
+      if(zones[zi].type == ZT_Resistance && c1 <= zones[zi].high) signal.resistanceHolding = true;
    }
 
-   // Retest logic
+    // detect close-confirmed breaks and track broken levels
+   for(int i = 0; i < ArraySize(zones); i++)
+   {
+      if(!zones[i].active) continue;
+      if(zones[i].type == ZT_Support)
+      {
+         double lvl = zones[i].low;
+         bool brokenNow = (c2 >= lvl && c1 < lvl - ZoneInvalidationBufferPts * _Point);
+         if(brokenNow && (bar1Time != lastBreakSupportEvent || MathAbs(lvl - lastBreakSupportLevel) > _Point))
+         {
+            observationState = OBS_WaitBreakRetestSupport;
+            brokenSupportLevel = lvl;
+            brokenSupportTime = bar1Time;
+            lastBreakSupportEvent = bar1Time;
+            lastBreakSupportLevel = lvl;
+         }
+      }
+      else
+      {
+         double lvl = zones[i].high;
+         bool brokenNow = (c2 <= lvl && c1 > lvl + ZoneInvalidationBufferPts * _Point);
+         if(brokenNow && (bar1Time != lastBreakResistanceEvent || MathAbs(lvl - lastBreakResistanceLevel) > _Point))
+         {
+            observationState = OBS_WaitBreakRetestResistance;
+            brokenResistanceLevel = lvl;
+            brokenResistanceTime = bar1Time;
+            lastBreakResistanceEvent = bar1Time;
+            lastBreakResistanceLevel = lvl;
+         }
+      }
+   }
+
+   // retest confirmation
    if(RequireRetestAfterBreak)
    {
-      double h1 = iHigh(_Symbol, ExecutionTF, 1);
-      double l1 = iLow(_Symbol, ExecutionTF, 1);
-
       if(observationState == OBS_WaitBreakRetestSupport)
       {
-         // old support becomes resistance; retest from below + bearish PA
-         if(h1 >= zones[zi].low && c1 < zones[zi].low && signal.bearishPA)
-            signal.breakoutRetestBear = true;
+         if(BarsSince(brokenSupportTime) > RetestMaxBars)
+         {
+            observationState = OBS_None;
+            brokenSupportLevel = 0.0;
+         }
+         else
+         {
+            double tol = RetestTouchTolerancePts * _Point;
+            bool touched = (h1 >= brokenSupportLevel - tol && l1 <= brokenSupportLevel + tol);
+            bool acceptBelow = (c1 < brokenSupportLevel - tol * 0.2);
+            bool rejection = (upperW1 > body1 * 1.2 || signal.bearishScore > signal.bullishScore);
+            if(touched && acceptBelow && rejection && signal.bearishPA)
+               signal.breakoutRetestBear = true;
+         }
       }
       if(observationState == OBS_WaitBreakRetestResistance)
       {
-         // old resistance becomes support; retest from above + bullish PA
-         if(l1 <= zones[zi].high && c1 > zones[zi].high && signal.bullishPA)
-            signal.breakoutRetestBull = true;
+         if(BarsSince(brokenResistanceTime) > RetestMaxBars)
+         {
+            observationState = OBS_None;
+            brokenResistanceLevel = 0.0;
+         }
+         else
+         {
+            double tol = RetestTouchTolerancePts * _Point;
+            bool touched = (l1 <= brokenResistanceLevel + tol && h1 >= brokenResistanceLevel - tol);
+            bool acceptAbove = (c1 > brokenResistanceLevel + tol * 0.2);
+            bool rejection = (lowerW1 > body1 * 1.2 || signal.bullishScore > signal.bearishScore);
+            if(touched && acceptAbove && rejection && signal.bullishPA)
+               signal.breakoutRetestBull = true;
+         }
       }
    }
+
+   if(inZone && observationBars > ObservationBarsMax && observationState != OBS_WaitBreakRetestSupport && observationState != OBS_WaitBreakRetestResistance)
+      observationState = OBS_None;
 }
 
 //=================== ENGINE: RISK ===================
@@ -805,10 +1143,16 @@ void ComputeProbability(bool isBuy)
    // supply/demand proxy from zone type+strength
    int sdRaw = zoneRaw;
 
-   // price action
-   int paRaw = 25;
-   if(isBuy && signal.bullishPA) paRaw = 85;
-   if(!isBuy && signal.bearishPA) paRaw = 85;
+   if(isBuy && market.bosBullExternal) structureRaw += 8;
+   if(!isBuy && market.bosBearExternal) structureRaw += 8;
+   if(isBuy && market.bosBullInternal) structureRaw += 4;
+   if(!isBuy && market.bosBearInternal) structureRaw += 4;
+   structureRaw = (int)MathMax(0, MathMin(100, structureRaw));
+
+   // price action directional score
+   int paRaw = (isBuy ? signal.bullishScore : signal.bearishScore);
+   if(isBuy && signal.bullishPA) paRaw = MathMax(paRaw, 80);
+   if(!isBuy && signal.bearishPA) paRaw = MathMax(paRaw, 80);
 
    // liquidity
    int liqRaw = market.liquidityScore * 10;
@@ -848,7 +1192,7 @@ void ComputeProbability(bool isBuy)
 //=================== EXECUTION ===================
 double ComputeLotByRisk(double slDistancePoints)
 {
-   if(!UseRiskPercent || RiskPercent <= 0) return FixedLot;
+   if(!UseRiskPercent || RiskPercent <= 0) return NormalizeVolumeToSymbol(FixedLot);
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskMoney = equity * (RiskPercent / 100.0);
@@ -857,17 +1201,36 @@ double ComputeLotByRisk(double slDistancePoints)
 
    double lot = riskMoney / (slDistancePoints * tickValue);
 
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   if(step <= 0) step = 0.01;
-
-   lot = MathRound(lot / step) * step;
-   lot = MathMax(minLot, MathMin(maxLot, lot));
-   return lot;
+   return NormalizeVolumeToSymbol(lot);
 }
 
-bool PlaceTrade(bool isBuy)
+double FindRecentConfirmedSwing(bool forBuy, double referencePrice)
+{
+   for(int i = ArraySize(swings) - 1; i >= 0; i--)
+   {
+      if(forBuy && !swings[i].isHigh && swings[i].price < referencePrice) return swings[i].price;
+      if(!forBuy && swings[i].isHigh && swings[i].price > referencePrice) return swings[i].price;
+   }
+   return 0.0;
+}
+
+void MaybeLogSetupStats()
+{
+   if(!EnableSetupStatsLogging || SetupStatsLogEveryBars <= 0) return;
+   barsSinceStatsLog++;
+   if(barsSinceStatsLog < SetupStatsLogEveryBars) return;
+   barsSinceStatsLog = 0;
+
+   string n1 = "SupportBounce", n2 = "ResistanceReject", n3 = "BullBreakRetest", n4 = "BearBreakRetest", n5 = "FalseBreakReversal";
+   PrintFormat("IronHide SetupStats | %s A:%d W:%d L:%d Net:%.2f AvgR:%.2f | %s A:%d W:%d L:%d Net:%.2f AvgR:%.2f | %s A:%d W:%d L:%d Net:%.2f AvgR:%.2f | %s A:%d W:%d L:%d Net:%.2f AvgR:%.2f | %s A:%d W:%d L:%d Net:%.2f AvgR:%.2f",
+               n1, setupStats[SETUP_SupportBounce].attempts, setupStats[SETUP_SupportBounce].wins, setupStats[SETUP_SupportBounce].losses, setupStats[SETUP_SupportBounce].netProfit, (setupStats[SETUP_SupportBounce].closedTrades>0?setupStats[SETUP_SupportBounce].totalR/setupStats[SETUP_SupportBounce].closedTrades:0.0),
+               n2, setupStats[SETUP_ResistanceRejection].attempts, setupStats[SETUP_ResistanceRejection].wins, setupStats[SETUP_ResistanceRejection].losses, setupStats[SETUP_ResistanceRejection].netProfit, (setupStats[SETUP_ResistanceRejection].closedTrades>0?setupStats[SETUP_ResistanceRejection].totalR/setupStats[SETUP_ResistanceRejection].closedTrades:0.0),
+               n3, setupStats[SETUP_BullBreakoutRetest].attempts, setupStats[SETUP_BullBreakoutRetest].wins, setupStats[SETUP_BullBreakoutRetest].losses, setupStats[SETUP_BullBreakoutRetest].netProfit, (setupStats[SETUP_BullBreakoutRetest].closedTrades>0?setupStats[SETUP_BullBreakoutRetest].totalR/setupStats[SETUP_BullBreakoutRetest].closedTrades:0.0),
+               n4, setupStats[SETUP_BearBreakoutRetest].attempts, setupStats[SETUP_BearBreakoutRetest].wins, setupStats[SETUP_BearBreakoutRetest].losses, setupStats[SETUP_BearBreakoutRetest].netProfit, (setupStats[SETUP_BearBreakoutRetest].closedTrades>0?setupStats[SETUP_BearBreakoutRetest].totalR/setupStats[SETUP_BearBreakoutRetest].closedTrades:0.0),
+               n5, setupStats[SETUP_FalseBreakReversal].attempts, setupStats[SETUP_FalseBreakReversal].wins, setupStats[SETUP_FalseBreakReversal].losses, setupStats[SETUP_FalseBreakReversal].netProfit, (setupStats[SETUP_FalseBreakReversal].closedTrades>0?setupStats[SETUP_FalseBreakReversal].totalR/setupStats[SETUP_FalseBreakReversal].closedTrades:0.0));
+}
+
+bool PlaceTrade(bool isBuy, int setupCategory)
 {
    if(!PassRiskGuards()) return false;
 
@@ -911,11 +1274,11 @@ bool PlaceTrade(bool isBuy)
       else tp = price - atr*2.0;
    }
 
-   sl = NormalizeDouble(sl, _Digits);
-   tp = NormalizeDouble(tp, _Digits);
+   ValidateStopsBySymbolRules(isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, price, sl, tp);
 
    double slPts = MathAbs(price - sl) / _Point;
    double lot = ComputeLotByRisk(slPts);
+   lot = NormalizeVolumeToSymbol(lot);
 
    trade.SetExpertMagicNumber(Strategy_ID);
    bool ok = false;
@@ -926,8 +1289,108 @@ bool PlaceTrade(bool isBuy)
 
    if(!ok)
       PrintFormat("IronHidePro order failed. Retcode=%d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   else
+   {
+      if(setupCategory > SETUP_None && setupCategory <= SETUP_FalseBreakReversal)
+      {
+         setupStats[setupCategory].attempts++;
+         ulong deal = trade.ResultDeal();
+         if(deal > 0 && HistoryDealSelect(deal))
+         {
+            ulong posId = (ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID);
+            double riskMoney = EstimateRiskMoney(slPts, lot);
+            RegisterTrackedPosition(posId, setupCategory, riskMoney);
+         }
+      }
+   }
 
    return ok;
+}
+
+void ManageOpenPositions()
+{
+   double atr = GetATR();
+   if(atr <= 0) atr = 100 * _Point;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Strategy_ID) continue;
+
+      ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+      if(sl <= 0) continue;
+
+      double riskAbs = MathAbs(entry - sl);
+      if(riskAbs <= _Point) riskAbs = atr;
+      double currentPrice = (ptype == POSITION_TYPE_BUY ? bid : ask);
+      double progressR = (ptype == POSITION_TYPE_BUY ? (currentPrice - entry) : (entry - currentPrice)) / riskAbs;
+
+      // break-even activation
+      if(progressR >= BreakEvenActivationR)
+      {
+         double beSL = (ptype == POSITION_TYPE_BUY ? entry + _Point * 2 : entry - _Point * 2);
+         if((ptype == POSITION_TYPE_BUY && beSL > sl) || (ptype == POSITION_TYPE_SELL && beSL < sl))
+         {
+            double s = beSL, t = tp;
+            ValidateStopsBySymbolRules(ptype == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, currentPrice, s, t);
+            if(!trade.PositionModify(_Symbol, s, t))
+               PrintFormat("IronHidePro BE modify failed. Retcode=%d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+            else sl = s;
+         }
+      }
+
+      // swing-aware trailing with ATR fallback
+      double swing = FindRecentConfirmedSwing(ptype == POSITION_TYPE_BUY, currentPrice);
+      double trailSL = sl;
+      if(ptype == POSITION_TYPE_BUY)
+      {
+         double swingBased = (swing > 0 ? swing - atr * ATRTrailMultiplier : currentPrice - atr * ATRTrailMultiplier);
+         trailSL = MathMax(sl, swingBased);
+      }
+      else
+      {
+         double swingBased = (swing > 0 ? swing + atr * ATRTrailMultiplier : currentPrice + atr * ATRTrailMultiplier);
+         trailSL = MathMin(sl, swingBased);
+      }
+
+      if((ptype == POSITION_TYPE_BUY && trailSL > sl) || (ptype == POSITION_TYPE_SELL && trailSL < sl))
+      {
+         double s = trailSL, t = tp;
+         ValidateStopsBySymbolRules(ptype == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, currentPrice, s, t);
+         if(!trade.PositionModify(_Symbol, s, t))
+            PrintFormat("IronHidePro trail modify failed. Retcode=%d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      }
+
+      // setup invalidation handling: tighten or exit
+      bool invalidBuy = (ptype == POSITION_TYPE_BUY && market.bosBear && market.sellerStrength > market.buyerStrength + 8);
+      bool invalidSell = (ptype == POSITION_TYPE_SELL && market.bosBull && market.buyerStrength > market.sellerStrength + 8);
+      if(ExitOnSetupInvalidation && (invalidBuy || invalidSell))
+      {
+         bool strongFlip = (invalidBuy && market.chochBear) || (invalidSell && market.chochBull);
+         if(strongFlip)
+         {
+            if(!trade.PositionClose(_Symbol))
+               PrintFormat("IronHidePro invalidation close failed. Retcode=%d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+         }
+         else
+         {
+            double tighten = (ptype == POSITION_TYPE_BUY ? currentPrice - atr * 0.7 : currentPrice + atr * 0.7);
+            if((ptype == POSITION_TYPE_BUY && tighten > sl) || (ptype == POSITION_TYPE_SELL && tighten < sl))
+            {
+               double s = tighten, t = tp;
+               ValidateStopsBySymbolRules(ptype == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, currentPrice, s, t);
+               trade.PositionModify(_Symbol, s, t);
+            }
+         }
+      }
+   }
 }
 
 //=================== DECISION PIPELINE ===================
@@ -951,18 +1414,42 @@ void RunDecisionPipeline()
    // 5..11: Probability and risk validation for each side
    bool buyCandidate = false;
    bool sellCandidate = false;
+   int buySetupCategory = SETUP_None;
+   int sellSetupCategory = SETUP_None;
 
    // buy logic from observation outcomes
-   if(observationState == OBS_AtSupport && signal.supportHolding && signal.bullishPA)
+   if(observationState == OBS_AtSupport && observationBars >= ObservationBarsMin && signal.supportHolding && signal.bullishPA)
+   {
       buyCandidate = true;
+      buySetupCategory = SETUP_SupportBounce;
+   }
    if(observationState == OBS_WaitBreakRetestResistance && signal.breakoutRetestBull)
+   {
       buyCandidate = true;
+      buySetupCategory = SETUP_BullBreakoutRetest;
+   }
+   if(signal.falseBreakdown && signal.bullishPA)
+   {
+      buyCandidate = true;
+      if(buySetupCategory == SETUP_None) buySetupCategory = SETUP_FalseBreakReversal;
+   }
 
    // sell logic from observation outcomes
-   if(observationState == OBS_AtResistance && signal.resistanceHolding && signal.bearishPA)
+   if(observationState == OBS_AtResistance && observationBars >= ObservationBarsMin && signal.resistanceHolding && signal.bearishPA)
+   {
       sellCandidate = true;
+      sellSetupCategory = SETUP_ResistanceRejection;
+   }
    if(observationState == OBS_WaitBreakRetestSupport && signal.breakoutRetestBear)
+   {
       sellCandidate = true;
+      sellSetupCategory = SETUP_BearBreakoutRetest;
+   }
+   if(signal.falseBreakout && signal.bearishPA)
+   {
+      sellCandidate = true;
+      if(sellSetupCategory == SETUP_None) sellSetupCategory = SETUP_FalseBreakReversal;
+   }
 
    // Never trade on single signal: require aligned independent factors
    if(buyCandidate)
@@ -976,7 +1463,7 @@ void RunDecisionPipeline()
       {
          ComputeProbability(true);
          if(pb.total >= MinProbabilityToTrade)
-            PlaceTrade(true);
+            PlaceTrade(true, buySetupCategory);
       }
    }
 
@@ -991,9 +1478,12 @@ void RunDecisionPipeline()
       {
          ComputeProbability(false);
          if(pb.total >= MinProbabilityToTrade)
-            PlaceTrade(false);
+            PlaceTrade(false, sellSetupCategory);
       }
    }
+
+   ManageOpenPositions();
+   MaybeLogSetupStats();
 }
 
 void UpdateDailyState()
@@ -1012,6 +1502,39 @@ void UpdateDailyState()
    }
 }
 
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0) return;
+   if(!HistoryDealSelect(trans.deal)) return;
+
+   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol) return;
+   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != Strategy_ID) return;
+
+   int entryType = (int)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entryType != DEAL_ENTRY_OUT && entryType != DEAL_ENTRY_OUT_BY) return;
+
+   ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+                 + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+                 + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+
+   int cat = SETUP_None;
+   double riskMoney = 0.0;
+   if(!PopTrackedPosition(posId, cat, riskMoney)) return;
+   if(cat <= SETUP_None || cat > SETUP_FalseBreakReversal) return;
+
+   if(profit >= 0) setupStats[cat].wins++;
+   else setupStats[cat].losses++;
+   setupStats[cat].netProfit += profit;
+   setupStats[cat].closedTrades++;
+
+   if(riskMoney > 0)
+      setupStats[cat].totalR += (profit / riskMoney);
+
+   if(profit < 0) consecutiveLosses++;
+   else consecutiveLosses = 0;
+}
+
 //=================== LIFECYCLE ===================
 int OnInit()
 {
@@ -1027,8 +1550,20 @@ int OnInit()
 
    dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    peakEquity = dayStartEquity;
+   ArrayResize(trackedPositionIds, 0);
+   ArrayResize(trackedPositionCategory, 0);
+   ArrayResize(trackedPositionRiskMoney, 0);
+   for(int i = 0; i < ArraySize(setupStats); i++)
+   {
+      setupStats[i].attempts = 0;
+      setupStats[i].wins = 0;
+      setupStats[i].losses = 0;
+      setupStats[i].netProfit = 0.0;
+      setupStats[i].totalR = 0.0;
+      setupStats[i].closedTrades = 0;
+   }
 
-   Print("IronHide Pro v3 Phase 1 initialized.");
+   Print("IronHide Pro v3 Phase 2 initialized.");
    return(INIT_SUCCEEDED);
 }
 
@@ -1055,13 +1590,15 @@ void OnTick()
    RunDecisionPipeline();
 
    Comment(
-      "IronHide Pro v3 (Phase 1)\n",
+     "IronHide Pro v3 (Phase 2)\n",
       "Regime: ", (string)market.regime, "\n",
       "ObsState: ", (string)observationState, " Bars: ", observationBars, "\n",
       "Buyer/Seller: ", DoubleToString(market.buyerStrength,1), " / ", DoubleToString(market.sellerStrength,1), "\n",
-      "PB Total: ", pb.total, " (min ", MinProbabilityToTrade, ")\n",
-      "BOS bull/bear: ", market.bosBull, " / ", market.bosBear, "\n",
-      "CHOCH bull/bear: ", market.chochBull, " / ", market.chochBear
+     "PA score B/S: ", signal.bullishScore, " / ", signal.bearishScore, "\n",
+     "PB Total: ", pb.total, " (min ", MinProbabilityToTrade, ")\n",
+     "BOS bull/bear: ", market.bosBull, " / ", market.bosBear, "\n",
+     "CHOCH bull/bear: ", market.chochBull, " / ", market.chochBear, "\n",
+     "StructDir: ", (string)market.structureDirection
    );
 }
 //+------------------------------------------------------------------+
