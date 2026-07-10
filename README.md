@@ -6,6 +6,40 @@ A hardened, modular Expert Advisor for MetaTrader 5 designed for XAUUSD scalping
 
 🔧 **In Development** — v1 baseline being built with modular signal engine and improved exit logic.
 
+## IronHide Pro v3 (Phase 2)
+
+`IronHide_Pro_v3_MT5.mq5` now includes a Phase 2 upgrade path focused on market-structure confirmation, richer candle psychology scoring, breakout/retest validation, adaptive trade management, and setup statistics scaffolding.
+
+### Phase 2 Highlights
+
+- **Structure engine hardening**
+  - Close-confirmed BOS checks using previous closed candle crossing logic
+  - Practical internal vs external structure split (ExecutionTF internal, StructureTF external)
+  - De-duplication of repeated break events
+  - Break timestamps and directional structure state tracking
+- **Price action / candle psychology scoring**
+  - Directional scoring for engulfing, hammer/shooting-star, pin bars, doji, marubozu, inside/outside bars
+  - Morning/evening-star proxies and three-soldiers/three-crows proxies
+  - Long-wick rejection and expansion/contraction psychology contributions
+- **Breakout/retest validation**
+  - Broken support/resistance level tracking
+  - Close-confirmed break then retest within configurable bars
+  - Retest acceptance/rejection uses close + wick + directional confirmation
+  - False-breakout/false-breakdown handling retained
+- **Adaptive management**
+  - Break-even trigger by configurable R progress
+  - Swing-aware trailing stop with ATR fallback
+  - Broker stop-distance validation for SL/TP updates
+  - Optional invalidation tightening/exit behavior
+- **Setup statistics scaffolding (no ML)**
+  - Tracks attempts, wins, losses, net P/L, and average R proxy for:
+    - support bounce
+    - resistance rejection
+    - bullish breakout-retest
+    - bearish breakout-retest
+    - false-break reversal
+  - Optional periodic log output
+
 ## Features
 
 - **Signal Edge**: EMA trend filter + RSI momentum confirmation (no blind entries)
@@ -20,6 +54,18 @@ A hardened, modular Expert Advisor for MetaTrader 5 designed for XAUUSD scalping
 2. Restart MT5 and attach to XAUUSD M1 chart
 3. Configure inputs (see **Inputs** section below)
 4. Test on demo first, then backtest before going live
+
+### Phase 2 compile/backtest checklist
+
+1. Open `IronHide_Pro_v3_MT5.mq5` in MetaEditor and compile with no errors
+2. Confirm indicator handles initialize on target symbol/timeframe
+3. Run Strategy Tester with **real ticks** and variable spread
+4. Validate:
+   - no-trade behavior during spread/session/news locks
+   - breakout/retest path activation and expiry (`RetestMaxBars`)
+   - break-even and trailing-stop modifications on open positions
+   - setup-stats logs and category updates after closed trades
+5. Forward-test on demo before any live usage
 
 ## Inputs
 
@@ -117,7 +163,15 @@ Commission: 0.10 USD per million (XM typical)
 
 - `SafeLotGuardian_v2_MT5.mq5` — Legacy version (weak entry signal, kept for reference)
 - `BlackKnight_v1_MT5.mq5` — **New baseline** (modular signal + improved exits)
+- `IronHide_Pro_v3_MT5.mq5` — IronHide Pro architecture with Phase 2 upgrades
 - `README.md` — This file
+
+## Phase 2 limitations
+
+- Internal structure classification is a practical proxy inside one EA file (not a full multi-module market map).
+- Setup statistics rely on trade transaction/history approximations and should be validated in live terminal context.
+- MT5 broker execution rules (stops/freeze/filled price) can alter final SL/TP placement.
+- No profitability or trade-frequency guarantees are made.
 
 ## Broker Configuration
 
